@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Logs</title>
+</head>
+<body>
+  {{ if .TotalPages }}
+  <p>Page {{ .Page }} of {{ .TotalPages }} ({{ .TotalLines }} lines total, {{ .Limit }} per page)</p>
+  <p>
+    {{ if .HasPrev }}
+    <a href="/logs?page={{ .PrevPage }}&limit={{ .Limit }}">Prev</a>
+    {{ end }}
+    {{ if .HasNext }}
+    <a href="/logs?page={{ .NextPage }}&limit={{ .Limit }}">Next</a>
+    {{ end }}
+  </p>
+  {{ end }}
+  <div>
+    {{ range $i, $v := .fileLines }}
+    <p>{{ . }}</p>
+    {{ end }}
+  </div>
+  {{ if and .TotalPages (gt .TotalPages 1) }}
+  <p>
+    {{ if .HasPrev }}
+    <a href="/logs?page={{ .PrevPage }}&limit={{ .Limit }}">Prev</a>
+    {{ end }}
+    {{ if .HasNext }}
+    <a href="/logs?page={{ .NextPage }}&limit={{ .Limit }}">Next</a>
+    {{ end }}
+  </p>
+  {{ end }}
+</body>
+</html>
