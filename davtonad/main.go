@@ -45,6 +45,11 @@ func authenticateWithAD(username, password string) (bool, userDetails, error) {
 	bindDN := os.Getenv("LDAP_BIND_DN")             // e.g., "cn=admin,dc=example,dc=com"
 	bindPassword := os.Getenv("LDAP_BIND_PASSWORD") // e.g., "adminpassword"
 	ldapServerName := os.Getenv("LDAP_SERVERNAME")  // e.g., "your-ldap-server.com"
+	
+	// G402: Default to secure TLS verification. Only skip in development/testing environments.
+	// SECURITY WARNING: Setting SKIP_INSECURE_VERIFICATION=true disables certificate validation
+	// and makes the connection vulnerable to man-in-the-middle attacks. Use ONLY in controlled
+	// development/testing environments, NEVER in production.
 	ldapSkipInsecureVer := false
 
 	if v := os.Getenv("SKIP_INSECURE_VERIFICATION"); v != "" {
@@ -54,6 +59,13 @@ func authenticateWithAD(username, password string) (bool, userDetails, error) {
 			ldapSkipInsecureVer = false
 		} else {
 			ldapSkipInsecureVer = parsed
+			if ldapSkipInsecureVer {
+				// Log security warning when TLS verification is disabled
+				logger.Log.Warn("authenticateWithAD", 
+					"msg", "SECURITY WARNING: TLS certificate verification disabled",
+					"risk", "vulnerable to man-in-the-middle attacks",
+					"recommendation", "use valid TLS certificates in production")
+			}
 		}
 	}
 
@@ -66,8 +78,11 @@ func authenticateWithAD(username, password string) (bool, userDetails, error) {
 	}
 
 	// Connect to the LDAP server
+	// G402: InsecureSkipVerify is configurable via SKIP_INSECURE_VERIFICATION env var.
+	// Defaults to false (secure). See security warning above for risks when enabled.
+	// #nosec G402 - Intentionally configurable for development environments with proper warnings
 	l, err := ldap.DialURL(ldapURL, ldap.DialWithTLSConfig(&tls.Config{
-		InsecureSkipVerify: ldapSkipInsecureVer, // Should be false in production
+		InsecureSkipVerify: ldapSkipInsecureVer,
 		ServerName:         ldapServerName,
 	}))
 	if err != nil {
@@ -286,6 +301,17 @@ func ShowLogs(c *fiber.Ctx) error {
 	}
 
 	filePath := logger.LogPath()
+	
+	// G304: Validate file path to prevent path traversal attacks.
+	if err := logger.ValidateLogPath(filePath); err != nil {
+		logger.Log.Error("ShowLogs", "err", err, "path", filePath, "msg", "invalid log path")
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid log path"})
+	}
+	
+	// #nosec G304 - Path validated by ValidateLogPath which checks for:
+	// - Path traversal sequences (..)
+	// - Path confinement to resources directory
+	// - File extension restriction (.txt only)
 	f, err := os.Open(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {

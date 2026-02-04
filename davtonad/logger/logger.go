@@ -1,10 +1,12 @@
 package logger
 
 import (
+	"errors"
 	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,7 +22,8 @@ func Start() {
 	mu.Lock()
 	defer mu.Unlock()
 	
-	file, err := os.OpenFile(LogPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0660)
+	// G302: Use 0600 permissions (owner read/write only) for security best practices.
+	file, err := os.OpenFile(LogPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
 	if err != nil {
 		log.Println("logger: failed to open log file:", err)
 		// Fall back to stderr so the application can run without a log file.
@@ -46,6 +49,33 @@ func GetLogger() *slog.Logger {
 
 func LogPath() string {
 	return GetRoot() + time.Now().Format("20060102") + ".txt"
+}
+
+// ValidateLogPath ensures the file path is safe and within the expected directory.
+// Prevents path traversal attacks (G304 mitigation).
+func ValidateLogPath(path string) error {
+	// Clean the path to resolve any . or .. components
+	cleanPath := filepath.Clean(path)
+	
+	// Get the expected root directory
+	root := filepath.Clean(GetRoot())
+	
+	// Check for path traversal attempts
+	if strings.Contains(path, "..") {
+		return errors.New("path traversal detected: .. not allowed")
+	}
+	
+	// Ensure the path is within the expected directory
+	if !strings.HasPrefix(cleanPath, root) {
+		return errors.New("path outside allowed directory")
+	}
+	
+	// Ensure it's a .txt file in the resources directory
+	if filepath.Ext(cleanPath) != ".txt" {
+		return errors.New("invalid file type: only .txt files allowed")
+	}
+	
+	return nil
 }
 
 func GetRoot() string {
