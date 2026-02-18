@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -22,7 +24,9 @@ import (
 
 // Safe limits for log viewing to prevent resource exhaustion (DoS).
 const (
-	maxLogSizeMB = 10
+	MAX_LOG_LINES = 1000   // absolute cap on lines per readLogPage; silences DoS via large skip/take
+	maxLineSize   = 64 * 1024 // 64KB max per line for scanner buffer
+	maxLogSizeMB  = 10
 	// Pagination: only one page of lines is loaded into memory.
 	defaultPageSize = 100
 	maxPageSize     = 500
@@ -30,7 +34,16 @@ const (
 	maxLineLength = 64 * 1024 // 64KB per line
 	// Maximum total memory for a single page: sum of all line lengths cannot exceed this.
 	maxPageMemoryBytes = 5 * 1024 * 1024 // 5MB per page
+	// maxLinesPerPage is the absolute cap on lines returned in one request; guards against unbounded slice growth.
+	//maxLinesPerPage = 1000
+	// maxScannerBufferSize is the explicit cap for bufio.Scanner token size (per-line); prevents huge single-line allocation.
+	//maxScannerBufferSize = 64 * 1024 // 64KB
+	// maxSkipLines is the maximum number of lines we will skip; prevents abuse via very large skip values.
+	//	maxSkipLines = 10_000_000
 )
+
+// loggerMu serializes access to logger cleanup from main and the background goroutine (race-safe).
+var loggerMu sync.Mutex
 
 type userDetails struct {
 	Firstname string
@@ -85,11 +98,16 @@ func authenticateWithAD(username, password string) (bool, userDetails, error) {
 		InsecureSkipVerify: ldapSkipInsecureVer,
 		ServerName:         ldapServerName,
 	}))
+
 	if err != nil {
 		logger.Log.Error("authenticateWithAD", "err", err, "msg", "Failed to connect to LDAP server")
 		return false, staffDetails, err
 	}
-	defer l.Close()
+	defer func() {
+		if cerr := l.Close(); cerr != nil {
+			logger.Log.Error("authenticateWithAD", "err", cerr, "msg", "Failed to close LDAP connection")
+		}
+	}()
 
 	// Set timeouts
 	l.SetTimeout(5 * time.Second)
@@ -228,19 +246,27 @@ func countLines(f *os.File) (int, error) {
 
 // readLogPage reads a single page of lines: skips the first 'skip' lines, then reads 'take' lines.
 // The returned slice is ordered newest-first for display (reversed from file order).
-// Enforces strict memory limits: max line length and total page memory to prevent DoS.
+// Enforces MAX_LOG_LINES and maxLineSize to prevent DoS from unbounded memory.
 func readLogPage(f *os.File, skip, take int) ([]string, error) {
+	// Validate and clamp inputs so a malicious caller cannot exhaust memory.
+	if take <= 0 || take > MAX_LOG_LINES {
+		take = MAX_LOG_LINES
+	}
+	if skip < 0 {
+		skip = 0
+	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek failed: %w", err)
 	}
 	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 4096)
-	scanner.Buffer(buf, maxLineLength)
+	scanner.Buffer(make([]byte, 0, maxLineSize), maxLineSize)
 	lines := make([]string, 0, take)
 	skipped := 0
 	totalMemory := 0
-	
 	for scanner.Scan() {
+		if len(lines) >= MAX_LOG_LINES {
+			break
+		}
 		if skipped < skip {
 			skipped++
 			continue
@@ -282,37 +308,47 @@ func readLogPage(f *os.File, skip, take int) ([]string, error) {
 }
 
 // ShowLogs serves log file content with pagination. Only one page of lines is loaded into memory.
-// Query params: page (1-based, default 1), limit (default 100, max 500). Newest lines first.
+// Query params: page (1-based, default 1), limit (default 20, max 500). Newest lines first.
 func ShowLogs(c *fiber.Ctx) error {
-	page := 1
-	if p := c.Query("page"); p != "" {
-		if v, err := strconv.Atoi(p); err == nil && v > 0 {
-			page = v
-		}
+	pageStr := c.Query("page")
+	if pageStr == "" {
+		pageStr = "1"
 	}
-	limit := defaultPageSize
-	if l := c.Query("limit"); l != "" {
-		if v, err := strconv.Atoi(l); err == nil && v > 0 {
-			if v > maxPageSize {
-				v = maxPageSize
-			}
-			limit = v
-		}
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page <= 0 {
+		logger.Log.Warn("ShowLogs", "msg", "invalid page param", "value", c.Query("page"), "ip", c.IP())
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid 'page' parameter: must be a positive integer",
+		})
+	}
+
+	limitStr := c.Query("limit")
+	if limitStr == "" {
+		limitStr = "20"
+	}
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		logger.Log.Warn("ShowLogs", "msg", "invalid limit param", "value", c.Query("limit"), "ip", c.IP())
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid 'limit' parameter: must be a positive integer",
+		})
+	}
+	if limit > maxPageSize {
+		limit = maxPageSize
 	}
 
 	filePath := logger.LogPath()
-	
-	// G304: Validate file path to prevent path traversal attacks.
+
+	// Validate the computed log path defensively.
 	if err := logger.ValidateLogPath(filePath); err != nil {
 		logger.Log.Error("ShowLogs", "err", err, "path", filePath, "msg", "invalid log path")
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid log path"})
 	}
+
+	// Use Go 1.24 traversal-resistant API: confine access to the resources root.
+	rootDir := logger.GetRoot()
+	f, err := os.OpenInRoot(rootDir, filepath.Base(filePath))
 	
-	// #nosec G304 - Path validated by ValidateLogPath which checks for:
-	// - Path traversal sequences (..)
-	// - Path confinement to resources directory
-	// - File extension restriction (.txt only)
-	f, err := os.Open(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return c.Status(http.StatusOK).Render("showlog", fiber.Map{
@@ -323,7 +359,12 @@ func ShowLogs(c *fiber.Ctx) error {
 		logger.Log.Error("ShowLogs", "err", err, "path", filePath)
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read logs"})
 	}
-	defer f.Close()
+
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			logger.Log.Error("ShowLogs", "err", cerr, "path", filePath, "msg", "failed to close log file")
+		}
+	}()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -390,13 +431,17 @@ func ShowLogs(c *fiber.Ctx) error {
 func main() {
 	logger.Start()
 
-	// Remove log files older than 3 days (retention policy).
+	// Remove log files older than 3 days (retention policy). Protected to avoid race with logger access.
+	loggerMu.Lock()
 	logger.CleanupOldLogs()
+	loggerMu.Unlock()
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
+			loggerMu.Lock()
 			logger.CleanupOldLogs()
+			loggerMu.Unlock()
 		}
 	}()
 
