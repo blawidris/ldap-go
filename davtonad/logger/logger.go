@@ -107,6 +107,19 @@ func CleanupOldLogs() {
 		log.Println("logger: cleanup ReadDir failed:", err)
 		return
 	}
+
+	// Open a traversal-resistant root for all cleanup operations (Go 1.24 os.Root API). [ASCA] safe filesystem access
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		log.Println("logger: OpenRoot failed:", err)
+		return
+	}
+	defer func() {
+		if cerr := r.Close(); cerr != nil {
+			log.Println("logger: root close failed:", cerr)
+		}
+	}()
+
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -124,11 +137,20 @@ func CleanupOldLogs() {
 			continue
 		}
 		if base < cutoffDate {
-			fpath := filepath.Join(root, name)
-			if err := os.Remove(fpath); err != nil {
-				log.Println("logger: cleanup remove failed:", fpath, err)
+			// Use the confined root to remove files safely; prevents path traversal. [ASCA] safe removal
+			if err := r.Remove(name); err != nil {
+				// Use structured logging and avoid leaking full filesystem paths.
+				if Log != nil {
+					Log.Error("CleanupOldLogs", "file", name, "err", err)
+				} else {
+					log.Println("logger: cleanup remove failed:", name, err)
+				}
 			} else {
-				log.Println("logger: deleted old log file:", fpath)
+				if Log != nil {
+					Log.Info("CleanupOldLogs", "msg", "deleted old log file", "file", name)
+				} else {
+					log.Println("logger: deleted old log file:", name)
+				}
 			}
 		}
 	}
