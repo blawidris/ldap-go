@@ -1,16 +1,17 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <style>html { display: none; }</style>
-  <script>
-    if (self === top) {
-      document.documentElement.style.display = 'block';
-    } else {
-      top.location = self.location;
-    }
-  </script>
   <meta charset="utf-8">
   <title>Logs</title>
+  <!--
+    F-01 / F-05 FIX: The frame-busting inline script (top.location = self.location) has been
+    removed. Frame embedding is prevented via HTTP response headers:
+      - X-Frame-Options: DENY  (legacy browser support)
+      - Content-Security-Policy: frame-ancestors 'none'  (modern browsers)
+    These server-side controls are more reliable than JavaScript-based frame-busting and
+    eliminate the DOM XSS (F-01) and Open Redirect (F-05) attack surfaces entirely.
+    Removing the inline script also allows a strict script-src 'self' CSP to be enforced.
+  -->
 </head>
 <body>
   {{ if .TotalPages }}
