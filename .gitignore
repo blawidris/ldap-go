@@ -1,0 +1,8 @@
+davtonad/config.env
+davtonad/.env
+davtonad/davtonad
+davtonad/resources/*.txt
+__MACOSX/
+.DS_Store
+.idea/
+.vscode/

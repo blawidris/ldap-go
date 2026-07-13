@@ -1,44 +1,25 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Logs</title>
-  <!--
-    F-01 / F-05 FIX: The frame-busting inline script (top.location = self.location) has been
-    removed. Frame embedding is prevented via HTTP response headers:
-      - X-Frame-Options: DENY  (legacy browser support)
-      - Content-Security-Policy: frame-ancestors 'none'  (modern browsers)
-    These server-side controls are more reliable than JavaScript-based frame-busting and
-    eliminate the DOM XSS (F-01) and Open Redirect (F-05) attack surfaces entirely.
-    Removing the inline script also allows a strict script-src 'self' CSP to be enforced.
-  -->
+  <title>Application Logs</title>
+  <style>html { display: none; }</style>
+  <script>if (self === top) { document.documentElement.style.display = "block"; } else { top.location = self.location; }</script>
 </head>
 <body>
-  {{ if .TotalPages }}
-  <p>Page {{ .Page }} of {{ .TotalPages }} ({{ .TotalLines }} lines total, {{ .Limit }} per page)</p>
-  <p>
+  <main>
+    <h1>Application Logs</h1>
+    <p>Page {{ .Page }} of {{ .TotalPages }} ({{ .TotalLines }} lines total)</p>
+
     {{ if .HasPrev }}
-    <a href="/logs?page={{ .PrevPage }}&limit={{ .Limit }}">Prev</a>
+      <a href="/logs?page={{ .PrevPage }}&limit={{ .Limit }}">Previous</a>
     {{ end }}
     {{ if .HasNext }}
-    <a href="/logs?page={{ .NextPage }}&limit={{ .Limit }}">Next</a>
+      <a href="/logs?page={{ .NextPage }}&limit={{ .Limit }}">Next</a>
     {{ end }}
-  </p>
-  {{ end }}
-  <div>
-    {{ range $i, $v := .fileLines }}
-    <p>{{ . }}</p>
-    {{ end }}
-  </div>
-  {{ if and .TotalPages (gt .TotalPages 1) }}
-  <p>
-    {{ if .HasPrev }}
-    <a href="/logs?page={{ .PrevPage }}&limit={{ .Limit }}">Prev</a>
-    {{ end }}
-    {{ if .HasNext }}
-    <a href="/logs?page={{ .NextPage }}&limit={{ .Limit }}">Next</a>
-    {{ end }}
-  </p>
-  {{ end }}
+
+    <pre>{{ range .Lines }}{{ . }}
+{{ end }}</pre>
+  </main>
 </body>
 </html>

@@ -6,152 +6,100 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
+	"regexp"
 	"time"
 )
 
-var (
-	Log  *slog.Logger
-	mu   sync.RWMutex // Protects Log variable from race conditions
-	cleanupMu sync.Mutex // Protects cleanup operations from concurrent access
+const (
+	logDirectory       = "resources"
+	logFilePermissions = 0600
+	logDirPermissions  = 0700
+	retentionDays      = 3
 )
 
-// Start initializes the logger. Thread-safe: uses mutex to prevent race conditions.
+var (
+	Log         *slog.Logger
+	logNameRule = regexp.MustCompile(`^[0-9]{8}[.]txt$`)
+)
+
 func Start() {
-	mu.Lock()
-	defer mu.Unlock()
-	
-	// G302: Use 0600 permissions (owner read/write only) for security best practices.
-	file, err := os.OpenFile(LogPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
-	if err != nil {
-		log.Println("logger: failed to open log file:", err)
-		// Fall back to stderr so the application can run without a log file.
-		Log = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{AddSource: true, Level: slog.LevelDebug}))
+	if err := os.MkdirAll(logDirectory, logDirPermissions); err != nil {
+		log.Println("logger: failed to create log directory:", err)
+		Log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 		slog.SetDefault(Log)
 		return
 	}
-	opts := slog.HandlerOptions{
-		AddSource: true,
-		Level:     slog.LevelDebug,
+
+	file, err := os.OpenFile(currentLogPath(), os.O_WRONLY|os.O_CREATE|os.O_APPEND, logFilePermissions)
+	if err != nil {
+		log.Println("logger: failed to open log file:", err)
+		Log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+		slog.SetDefault(Log)
+		return
 	}
-	Log = slog.New(slog.NewJSONHandler(file, &opts))
-	// Do not close file: the handler uses it for the process lifetime.
+
+	Log = slog.New(slog.NewJSONHandler(file, &slog.HandlerOptions{
+		AddSource: true,
+		Level:     slog.LevelInfo,
+	}))
 	slog.SetDefault(Log)
 }
 
-// GetLogger returns the current logger instance in a thread-safe manner.
-func GetLogger() *slog.Logger {
-	mu.RLock()
-	defer mu.RUnlock()
-	return Log
+func TemplateDirectory() string {
+	return logDirectory
 }
 
-func LogPath() string {
-	return GetRoot() + time.Now().Format("20060102") + ".txt"
+func OpenCurrentLogForRead() (*os.File, error) {
+	name := currentLogName()
+	if !isManagedLogName(name) {
+		return nil, errors.New("invalid log file name")
+	}
+	return os.OpenInRoot(logDirectory, name)
 }
 
-// ValidateLogPath ensures the file path is safe and within the expected directory.
-// Prevents path traversal attacks (G304 mitigation).
-func ValidateLogPath(path string) error {
-	// Clean the path to resolve any . or .. components
-	cleanPath := filepath.Clean(path)
-	
-	// Get the expected root directory
-	root := filepath.Clean(GetRoot())
-	
-	// Check for path traversal attempts
-	if strings.Contains(path, "..") {
-		return errors.New("path traversal detected: .. not allowed")
-	}
-	
-	// Ensure the path is within the expected directory
-	if !strings.HasPrefix(cleanPath, root) {
-		return errors.New("path outside allowed directory")
-	}
-	
-	// Ensure it's a .txt file in the resources directory
-	if filepath.Ext(cleanPath) != ".txt" {
-		return errors.New("invalid file type: only .txt files allowed")
-	}
-	
-	return nil
-}
-
-func GetRoot() string {
-	path, err := os.Getwd()
-	if err != nil {
-		log.Println("logger: Getwd failed:", err)
-		// Use current directory relative path so templates can still be resolved.
-		return "resources/"
-	}
-	return path + "/resources/"
-}
-
-// LogRetentionDays is how long to keep log files before cleanup (default 3).
-const LogRetentionDays = 3
-
-// CleanupOldLogs removes log files (*.txt in resources/) older than LogRetentionDays.
-// Does not delete today's file (the one currently written to).
-// Thread-safe: uses mutex to prevent concurrent cleanup operations.
 func CleanupOldLogs() {
-	cleanupMu.Lock()
-	defer cleanupMu.Unlock()
-	
-	root := GetRoot()
-	cutoff := time.Now().AddDate(0, 0, -LogRetentionDays)
-	cutoffDate := cutoff.Format("20060102")
-
-	entries, err := os.ReadDir(root)
+	entries, err := os.ReadDir(logDirectory)
 	if err != nil {
-		log.Println("logger: cleanup ReadDir failed:", err)
+		log.Println("logger: failed to read log directory:", err)
 		return
 	}
-
-	// Open a traversal-resistant root for all cleanup operations (Go 1.24 os.Root API). [ASCA] safe filesystem access
-	r, err := os.OpenRoot(root)
+	root, err := os.OpenRoot(logDirectory)
 	if err != nil {
-		log.Println("logger: OpenRoot failed:", err)
+		log.Println("logger: failed to open log directory:", err)
 		return
 	}
 	defer func() {
-		if cerr := r.Close(); cerr != nil {
-			log.Println("logger: root close failed:", cerr)
+		if err := root.Close(); err != nil && Log != nil {
+			Log.Warn("log_cleanup", "message", "failed to close log directory", "error", err)
 		}
 	}()
 
-	for _, e := range entries {
-		if e.IsDir() {
+	cutoff := time.Now().AddDate(0, 0, -retentionDays).Format("20060102") + ".txt"
+	for _, entry := range entries {
+		if entry.IsDir() {
 			continue
 		}
-		name := e.Name()
-		if filepath.Ext(name) != ".txt" {
+		name := entry.Name()
+		if !isManagedLogName(name) {
 			continue
 		}
-		// Safe bounds check to prevent panic on malformed filenames.
-		if len(name) < 5 { // minimum: "X.txt"
+		if name >= cutoff {
 			continue
 		}
-		base := name[:len(name)-4] // strip .txt
-		if len(base) != 8 {
-			continue
-		}
-		if base < cutoffDate {
-			// Use the confined root to remove files safely; prevents path traversal. [ASCA] safe removal
-			if err := r.Remove(name); err != nil {
-				// Use structured logging and avoid leaking full filesystem paths.
-				if Log != nil {
-					Log.Error("CleanupOldLogs", "file", name, "err", err)
-				} else {
-					log.Println("logger: cleanup remove failed:", name, err)
-				}
-			} else {
-				if Log != nil {
-					Log.Info("CleanupOldLogs", "msg", "deleted old log file", "file", name)
-				} else {
-					log.Println("logger: deleted old log file:", name)
-				}
-			}
+		if err := root.Remove(name); err != nil && Log != nil {
+			Log.Warn("log_cleanup", "message", "failed to remove old log", "error", err)
 		}
 	}
+}
+
+func currentLogPath() string {
+	return filepath.Join(logDirectory, currentLogName())
+}
+
+func currentLogName() string {
+	return time.Now().Format("20060102") + ".txt"
+}
+
+func isManagedLogName(name string) bool {
+	return logNameRule.MatchString(name)
 }

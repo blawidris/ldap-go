@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"crypto/tls"
 	"davtonad/logger"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,746 +19,618 @@ import (
 	"unicode"
 
 	"github.com/go-ldap/ldap/v3"
-	validation "github.com/go-ozzo/ozzo-validation"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/session"
 	"github.com/gofiber/template/html/v2"
-	"github.com/joho/godotenv"
 )
 
-// Safe limits for log viewing to prevent resource exhaustion (DoS).
 const (
-	MAX_LOG_LINES = 1000     // absolute cap on lines per readLogPage
-	maxLineSize   = 64 * 1024 // 64 KB max per line for scanner buffer
-	maxLogSizeMB  = 10
-	// Pagination
-	defaultPageSize = 100
-	maxPageSize     = 500
-	// Maximum line length (must equal maxLineSize — kept for clarity).
-	maxLineLength = 64 * 1024
-	// Maximum total memory per page.
-	maxPageMemoryBytes = 5 * 1024 * 1024 // 5 MB
+	defaultPort      = "9876"
+	dotEnvFileName   = ".env"
+	maxEnvFileBytes  = 64 * 1024
+	maxEnvLineBytes  = 4096
+	maxRequestBytes  = 16 * 1024
+	maxUsernameBytes = 256
+	minPasswordBytes = 15
+	maxPasswordBytes = 128
 
-	// Section 5.5 — APSC-DV-001680 CAT I: Password minimum length.
-	// NOTE: Align with the Active Directory domain password policy. Users whose AD
-	// passwords are shorter than this value will be rejected at the application layer.
-	minPasswordLength = 15
-	maxPasswordLength = 128 // prevents DoS via huge password hashing
-	maxUsernameLength = 256
+	loginAttemptsBeforeLock = 3
+	lockoutDuration         = 15 * time.Minute
+	sessionTimeout          = 15 * time.Minute
 
-	// Section 5.5 — APSC-DV-000530 CAT I: Account lockout policy.
-	maxLoginAttempts = 3
-	lockoutDuration  = 15 * time.Minute
-
-	// Section 3.2 — session lifetime (non-privileged users: 15 min idle, APSC-DV-000070).
-	sessionTimeout = 15 * time.Minute
+	defaultLogPageSize = 20
+	maxLogPageSize     = 200
+	maxLogLineBytes    = 16 * 1024
+	maxLogLines        = 1000
+	maxLogReadBytes    = 2 * 1024 * 1024
+	maxLogFileBytes    = 10 * 1024 * 1024
 )
 
-// loggerMu serializes access to logger cleanup from main and the background goroutine.
-var loggerMu sync.Mutex
-
-// Sentinel errors for readLogPage — callers use errors.Is() to distinguish kinds and return
-// sanitized HTTP responses without leaking internal state to clients.
 var (
-	ErrLineTooLong     = errors.New("log line exceeds maximum allowed size")
-	ErrTooManyLines    = errors.New("log page exceeds maximum allowed line count")
-	ErrPayloadTooLarge = errors.New("log read exceeds maximum allowed byte size")
+	errMissingConfig = errors.New("required configuration is missing")
+	errInvalidConfig = errors.New("configuration value is invalid")
+	errLineTooLong   = errors.New("log line exceeds maximum size")
+	errTooManyLines  = errors.New("log file has too many lines")
+	errReadTooLarge  = errors.New("log read exceeds maximum size")
 )
 
-// ---------------------------------------------------------------------------
-// Section 5.5 — Account lockout (APSC-DV-000530 CAT I)
-// In-memory tracker; sufficient for single-instance deployment.
-// ---------------------------------------------------------------------------
+type serverConfig struct {
+	Port             string
+	TLSCertificate   string
+	TLSPrivateKey    string
+	LDAPURL          string
+	LDAPBaseDN       string
+	LDAPBindDN       string
+	LDAPBindPassword string
+	LDAPServerName   string
+}
+
+type userDetails struct {
+	FirstName string
+	LastName  string
+	Email     string
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
 
 type lockoutEntry struct {
 	attempts int
-	lockedAt time.Time
+	locked   time.Time
 }
 
-var (
-	lockoutMu      sync.RWMutex
-	lockoutTracker = make(map[string]*lockoutEntry)
-)
+type authState struct {
+	mu       sync.Mutex
+	lockouts map[string]lockoutEntry
+	sessions *session.Store
+}
 
-// lockoutKey returns a normalised key for the lockout map.
-// Using lower-cased username prevents case-variation bypass.
-func lockoutKey(username string) string { return strings.ToLower(strings.TrimSpace(username)) }
+func main() {
+	logger.Start()
+	logger.CleanupOldLogs()
+	go runDailyLogCleanup()
 
-// isLockedOut reports whether the account is currently locked out.
-func isLockedOut(username string) bool {
-	key := lockoutKey(username)
-	lockoutMu.RLock()
-	entry, ok := lockoutTracker[key]
-	lockoutMu.RUnlock()
-	if !ok {
+	if err := loadDotEnv(); err != nil {
+		logger.Log.Error("startup", "error", err)
+		os.Exit(1)
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		logger.Log.Error("startup", "error", err)
+		os.Exit(1)
+	}
+
+	auth := &authState{
+		lockouts: make(map[string]lockoutEntry),
+		sessions: session.New(session.Config{
+			Expiration:     sessionTimeout,
+			CookieHTTPOnly: true,
+			CookieSecure:   true,
+			CookieSameSite: "Strict",
+			CookiePath:     "/",
+		}),
+	}
+
+	engine := html.New(logger.TemplateDirectory(), ".html")
+	engine.Reload(false)
+
+	app := fiber.New(fiber.Config{
+		Views:        engine,
+		BodyLimit:    maxRequestBytes,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
+	})
+
+	app.Use(limiter.New(limiter.Config{
+		Max:        10,
+		Expiration: time.Minute,
+	}))
+	app.Use(securityHeaders)
+
+	app.Post("/login", auth.loginHandler(cfg))
+	app.Get("/logs", auth.requireLogin, showLogs)
+
+	logger.Log.Info("startup", "message", "starting HTTPS server", "port", cfg.Port)
+	if err := app.ListenTLS(":"+cfg.Port, cfg.TLSCertificate, cfg.TLSPrivateKey); err != nil {
+		logger.Log.Error("startup", "error", err)
+		os.Exit(1)
+	}
+}
+
+func runDailyLogCleanup() {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		logger.CleanupOldLogs()
+	}
+}
+
+func loadConfig() (serverConfig, error) {
+	cfg := serverConfig{
+		Port:             envWithDefault("DAVTON_PORT", defaultPort),
+		TLSCertificate:   strings.TrimSpace(os.Getenv("TLS_CERT_FILE")),
+		TLSPrivateKey:    strings.TrimSpace(os.Getenv("TLS_KEY_FILE")),
+		LDAPURL:          strings.TrimSpace(os.Getenv("LDAP_URL")),
+		LDAPBaseDN:       strings.TrimSpace(os.Getenv("LDAP_BASE_DN")),
+		LDAPBindDN:       strings.TrimSpace(os.Getenv("LDAP_BIND_DN")),
+		LDAPBindPassword: os.Getenv("LDAP_BIND_PASSWORD"),
+		LDAPServerName:   strings.TrimSpace(os.Getenv("LDAP_SERVER_NAME")),
+	}
+
+	if cfg.TLSCertificate == "" ||
+		cfg.TLSPrivateKey == "" ||
+		cfg.LDAPURL == "" ||
+		cfg.LDAPBaseDN == "" ||
+		cfg.LDAPBindDN == "" ||
+		cfg.LDAPBindPassword == "" ||
+		cfg.LDAPServerName == "" {
+		return cfg, errMissingConfig
+	}
+	if !isSafeAbsolutePath(cfg.TLSCertificate) {
+		return cfg, fmt.Errorf("%w: TLS_CERT_FILE", errInvalidConfig)
+	}
+	if !isSafeAbsolutePath(cfg.TLSPrivateKey) {
+		return cfg, fmt.Errorf("%w: TLS_KEY_FILE", errInvalidConfig)
+	}
+
+	parsedLDAPURL, err := url.Parse(cfg.LDAPURL)
+	if err != nil {
+		return cfg, fmt.Errorf("%w: LDAP_URL", errInvalidConfig)
+	}
+	if parsedLDAPURL.Scheme != "ldaps" {
+		return cfg, fmt.Errorf("%w: LDAP_URL must use ldaps", errInvalidConfig)
+	}
+	if !isSafePort(cfg.Port) {
+		return cfg, fmt.Errorf("%w: DAVTON_PORT", errInvalidConfig)
+	}
+	return cfg, nil
+}
+
+func loadDotEnv() error {
+	file, err := os.Open(dotEnvFileName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() > maxEnvFileBytes {
+		return errors.New("environment file is too large")
+	}
+
+	reader := bufio.NewReaderSize(file, maxEnvLineBytes)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > maxEnvLineBytes {
+			return errors.New("environment file line is too long")
+		}
+		if errors.Is(err, io.EOF) {
+			if parseErr := setEnvLine(line); parseErr != nil {
+				return parseErr
+			}
+			break
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return errors.New("environment file line is too long")
+		}
+		if err != nil {
+			return err
+		}
+		if parseErr := setEnvLine(line); parseErr != nil {
+			return parseErr
+		}
+	}
+	return nil
+}
+
+func setEnvLine(line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+
+	key, value, found := strings.Cut(line, "=")
+	if !found {
+		return errors.New("environment file contains an invalid line")
+	}
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if !isEnvKey(key) {
+		return errors.New("environment file contains an invalid key")
+	}
+	value = strings.Trim(value, `"'`)
+	return os.Setenv(key, value)
+}
+
+func isEnvKey(key string) bool {
+	if key == "" {
 		return false
 	}
-	if entry.attempts < maxLoginAttempts {
-		return false
-	}
-	// Auto-expire lockout after lockoutDuration.
-	if time.Since(entry.lockedAt) >= lockoutDuration {
-		lockoutMu.Lock()
-		delete(lockoutTracker, key)
-		lockoutMu.Unlock()
+	for index, char := range key {
+		if char == '_' || unicode.IsUpper(char) || unicode.IsDigit(char) && index > 0 {
+			continue
+		}
 		return false
 	}
 	return true
 }
 
-// recordFailedAttempt increments the failure counter and sets lockout time on threshold.
-func recordFailedAttempt(username string) {
-	key := lockoutKey(username)
-	lockoutMu.Lock()
-	defer lockoutMu.Unlock()
-	entry, ok := lockoutTracker[key]
-	if !ok {
-		entry = &lockoutEntry{}
-		lockoutTracker[key] = entry
+func envWithDefault(name, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
 	}
-	entry.attempts++
-	if entry.attempts >= maxLoginAttempts {
-		entry.lockedAt = time.Now()
-	}
+	return value
 }
 
-// clearLockout resets the failure counter for an account (called on successful login).
-func clearLockout(username string) {
-	key := lockoutKey(username)
-	lockoutMu.Lock()
-	delete(lockoutTracker, key)
-	lockoutMu.Unlock()
+func isSafePort(port string) bool {
+	if port == "" || len(port) > 5 {
+		return false
+	}
+	number, err := strconv.Atoi(port)
+	return err == nil && number >= 1 && number <= 65535
 }
 
-// ---------------------------------------------------------------------------
-// Section 3.2 — Session store (APSC-DV-002210/2220, NIST SC-23)
-// ---------------------------------------------------------------------------
+func isSafeAbsolutePath(path string) bool {
+	cleanPath := filepath.Clean(path)
+	return filepath.IsAbs(cleanPath) && cleanPath == path && !strings.Contains(cleanPath, "..")
+}
 
-// sessionStore is initialised in main() after config.env is loaded so the
-// CookieSecure flag can be derived from the TLS configuration.
-var sessionStore *session.Store
+func securityHeaders(c *fiber.Ctx) error {
+	c.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'sha256-/zzODLln/Gwa3ZDOkMqVIywSh5Q276XEttWs21ogIFg='; style-src 'self' 'sha256-fWouOLTlgrCXIZBIvHZywCl6NXdM+RDwPzphaQcsqvU='; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+	c.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	c.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+	c.Set("X-Content-Type-Options", "nosniff")
+	c.Set("X-Frame-Options", "DENY")
+	return c.Next()
+}
 
-// authMiddleware enforces session-based authentication on protected routes.
-// Section 5.5: the /logs endpoint must not be accessible without a valid session.
-func authMiddleware(c *fiber.Ctx) error {
-	sess, err := sessionStore.Get(c)
+func (a *authState) requireLogin(c *fiber.Ctx) error {
+	sess, err := a.sessions.Get(c)
 	if err != nil {
-		logger.Log.Error("authMiddleware", "err", err, "ip", c.IP())
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+		logger.Log.Error("session", "error", err)
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})
 	}
 	if sess.Get("user_email") == nil {
-		logger.Log.Warn("authMiddleware", "msg", "unauthenticated access attempt", "ip", c.IP(), "path", c.Path())
-		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "Authentication required"})
+		logger.Log.Warn("session", "message", "unauthenticated request", "ip", c.IP(), "path", c.Path())
+		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "authentication required"})
 	}
 	return c.Next()
 }
 
-// ---------------------------------------------------------------------------
-// Section 5.5 — Password complexity (APSC-DV-001680 CAT I)
-// ---------------------------------------------------------------------------
-
-// checkPasswordComplexity is an ozzo-validation compatible validator.
-func checkPasswordComplexity(value interface{}) error {
-	password, _ := value.(string)
-	var hasUpper, hasLower, hasDigit, hasSpecial bool
-	for _, ch := range password {
-		switch {
-		case unicode.IsUpper(ch):
-			hasUpper = true
-		case unicode.IsLower(ch):
-			hasLower = true
-		case unicode.IsDigit(ch):
-			hasDigit = true
-		case unicode.IsPunct(ch) || unicode.IsSymbol(ch):
-			hasSpecial = true
+func (a *authState) loginHandler(cfg serverConfig) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if len(c.Body()) > maxRequestBytes {
+			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "request too large"})
 		}
+		if !strings.HasPrefix(c.Get("Content-Type"), "application/json") {
+			return c.Status(http.StatusUnsupportedMediaType).JSON(fiber.Map{"error": "content type must be application/json"})
+		}
+
+		var req loginRequest
+		if err := json.Unmarshal(c.Body(), &req); err != nil {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+		}
+		if err := validateLogin(req); err != nil {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		if a.isLocked(req.Username) {
+			logger.Log.Warn("login", "message", "locked account attempted login", "username", safeLogValue(normalizedUsername(req.Username)), "ip", c.IP())
+			return c.Status(http.StatusTooManyRequests).JSON(fiber.Map{"error": "account temporarily locked"})
+		}
+
+		user, err := authenticateWithLDAP(cfg, req.Username, req.Password)
+		if err != nil {
+			a.recordFailure(req.Username)
+			logger.Log.Warn("login", "message", "authentication failed", "username", safeLogValue(normalizedUsername(req.Username)), "ip", c.IP())
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "invalid username or password"})
+		}
+
+		a.clearFailures(req.Username)
+		sess, err := a.sessions.Get(c)
+		if err != nil {
+			logger.Log.Error("session", "error", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})
+		}
+		sess.Set("user_email", user.Email)
+		sess.Set("user_first_name", user.FirstName)
+		sess.Set("user_last_name", user.LastName)
+		if err := sess.Save(); err != nil {
+			logger.Log.Error("session", "error", err)
+			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})
+		}
+
+		logger.Log.Info("login", "message", "authentication succeeded", "username", safeLogValue(normalizedUsername(req.Username)), "ip", c.IP())
+		return c.Status(http.StatusOK).JSON(fiber.Map{
+			"status": true,
+			"data": fiber.Map{
+				"firstname": user.FirstName,
+				"lastname":  user.LastName,
+				"email":     user.Email,
+			},
+		})
 	}
-	if !hasUpper || !hasLower || !hasDigit || !hasSpecial {
-		return errors.New("password must contain uppercase, lowercase, digit, and special character")
+}
+
+func validateLogin(req loginRequest) error {
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		return errors.New("username is required")
+	}
+	if len(username) > maxUsernameBytes {
+		return errors.New("username is too long")
+	}
+	if len(req.Password) < minPasswordBytes {
+		return errors.New("password is too short")
+	}
+	if len(req.Password) > maxPasswordBytes {
+		return errors.New("password is too long")
+	}
+	if !hasRequiredPasswordClasses(req.Password) {
+		return errors.New("password does not meet complexity requirements")
 	}
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// LDAP authentication
-// ---------------------------------------------------------------------------
-
-type userDetails struct {
-	Firstname string
-	Lastname  string
-	Email     string
+func hasRequiredPasswordClasses(password string) bool {
+	var upper, lower, digit, special bool
+	for _, char := range password {
+		switch {
+		case unicode.IsUpper(char):
+			upper = true
+		case unicode.IsLower(char):
+			lower = true
+		case unicode.IsDigit(char):
+			digit = true
+		case unicode.IsPunct(char), unicode.IsSymbol(char):
+			special = true
+		}
+	}
+	return upper && lower && digit && special
 }
 
-func authenticateWithAD(username, password string) (bool, userDetails, error) {
-	ldapURL        := os.Getenv("LDAP_URL")
-	baseDN         := os.Getenv("LDAP_BASE_DN")
-	bindDN         := os.Getenv("LDAP_BIND_DN")
-	bindPassword   := os.Getenv("LDAP_BIND_PASSWORD")
-	ldapServerName := os.Getenv("LDAP_SERVERNAME")
+func authenticateWithLDAP(cfg serverConfig, username, password string) (userDetails, error) {
+	var user userDetails
 
-	// G402: Default to secure TLS verification. Only skip in development/testing environments.
-	// SECURITY WARNING: Setting SKIP_INSECURE_VERIFICATION=true disables certificate validation
-	// and makes the connection vulnerable to man-in-the-middle attacks. NEVER use in production.
-	ldapSkipInsecureVer := false
-	if v := os.Getenv("SKIP_INSECURE_VERIFICATION"); v != "" {
-		parsed, err := strconv.ParseBool(v)
-		if err != nil {
-			logger.Log.Error("authenticateWithAD", "err", err,
-				"msg", "invalid SKIP_INSECURE_VERIFICATION, defaulting to false", "value", v)
-		} else {
-			ldapSkipInsecureVer = parsed
-			if ldapSkipInsecureVer {
-				logger.Log.Warn("authenticateWithAD",
-					"msg", "SECURITY WARNING: TLS certificate verification disabled",
-					"risk", "vulnerable to man-in-the-middle attacks",
-					"recommendation", "use valid TLS certificates in production")
-			}
-		}
-	}
-
-	var staffDetails userDetails
-	if ldapURL == "" || baseDN == "" || bindDN == "" || bindPassword == "" {
-		logger.Log.Error("authenticateWithAD", "err", "one or more required env vars are missing")
-		return false, staffDetails, errors.New("LDAP configuration incomplete")
-	}
-
-	// Section 5.5 — TLS 1.2+ minimum (ASD STIG, PCI DSS 4.1).
-	// #nosec G402 — InsecureSkipVerify is runtime-configurable with explicit warning above.
-	l, err := ldap.DialURL(ldapURL, ldap.DialWithTLSConfig(&tls.Config{
-		InsecureSkipVerify: ldapSkipInsecureVer,
-		ServerName:         ldapServerName,
-		MinVersion:         tls.VersionTLS12, // enforce TLS 1.2 minimum; rejects TLS 1.0/1.1
+	conn, err := ldap.DialURL(cfg.LDAPURL, ldap.DialWithTLSConfig(&tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: cfg.LDAPServerName,
 	}))
 	if err != nil {
-		logger.Log.Error("authenticateWithAD", "err", err, "msg", "failed to connect to LDAP server")
-		return false, staffDetails, err
+		return user, err
 	}
-	defer func() {
-		if cerr := l.Close(); cerr != nil {
-			logger.Log.Error("authenticateWithAD", "err", cerr, "msg", "failed to close LDAP connection")
-		}
-	}()
+	defer conn.Close()
+	conn.SetTimeout(5 * time.Second)
 
-	l.SetTimeout(5 * time.Second)
-
-	if err = l.Bind(bindDN, bindPassword); err != nil {
-		logger.Log.Error("authenticateWithAD", "err", err, "msg", "service bind failed")
-		return false, staffDetails, err
+	if err := conn.Bind(cfg.LDAPBindDN, cfg.LDAPBindPassword); err != nil {
+		return user, err
 	}
-	logger.Log.Info("authenticateWithAD", "msg", "LDAP service bind successful")
 
-	searchFilter := fmt.Sprintf(
+	filter := fmt.Sprintf(
 		"(&(|(mail=%s)(sAMAccountName=%s))(objectClass=user))",
-		ldap.EscapeFilter(username),
-		ldap.EscapeFilter(username),
+		ldap.EscapeFilter(strings.TrimSpace(username)),
+		ldap.EscapeFilter(strings.TrimSpace(username)),
 	)
-	searchRequest := ldap.NewSearchRequest(
-		baseDN,
-		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 1, 0, false,
-		searchFilter,
-		[]string{"dn", "cn", "mail", "sAMAccountName", "givenName", "sn", "displayName"},
+	request := ldap.NewSearchRequest(
+		cfg.LDAPBaseDN,
+		ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases,
+		1,
+		5,
+		false,
+		filter,
+		[]string{"dn", "mail", "givenName", "sn"},
 		nil,
 	)
 
-	sr, err := l.Search(searchRequest)
+	result, err := conn.Search(request)
 	if err != nil {
-		logger.Log.Error("authenticateWithAD", "err", err)
-		return false, staffDetails, err
+		return user, err
 	}
-	if len(sr.Entries) != 1 {
-		logger.Log.Error("authenticateWithAD", "err", "user not found in ldap")
-		return false, staffDetails, errors.New("user not found")
+	if len(result.Entries) != 1 {
+		return user, errors.New("user not found")
 	}
 
-	userDN := sr.Entries[0].DN
-	if err = l.Bind(userDN, password); err != nil {
-		logger.Log.Error("authenticateWithAD", "err", err, "msg", "user credential bind failed")
-		return false, staffDetails, err
+	entry := result.Entries[0]
+	if err := conn.Bind(entry.DN, password); err != nil {
+		return user, err
 	}
 
-	staffDetails = userDetails{
-		Firstname: sr.Entries[0].GetAttributeValue("givenName"),
-		Lastname:  sr.Entries[0].GetAttributeValue("sn"),
-		Email:     sr.Entries[0].GetAttributeValue("mail"),
+	user = userDetails{
+		FirstName: entry.GetAttributeValue("givenName"),
+		LastName:  entry.GetAttributeValue("sn"),
+		Email:     entry.GetAttributeValue("mail"),
 	}
-	return true, staffDetails, nil
+	return user, nil
 }
 
-// ---------------------------------------------------------------------------
-// Login handler
-// ---------------------------------------------------------------------------
-
-type inputLogin struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+func normalizedUsername(username string) string {
+	return strings.ToLower(strings.TrimSpace(username))
 }
 
-// Validate enforces field presence, length limits, and password complexity.
-// Section 5.5 — APSC-DV-001680 CAT I: 15-char minimum.
-// NOTE: Coordinate minPasswordLength with the Active Directory domain password policy.
-func (s inputLogin) Validate() error {
-	return validation.ValidateStruct(&s,
-		validation.Field(&s.Username,
-			validation.Required,
-			validation.Length(1, maxUsernameLength),
-		),
-		validation.Field(&s.Password,
-			validation.Required,
-			validation.Length(minPasswordLength, maxPasswordLength),
-			validation.By(checkPasswordComplexity),
-		),
-	)
-}
-
-func loginHandler(c *fiber.Ctx) error {
-	// Body-size guard must run before parsing to prevent DoS via body allocation.
-	if len(c.Body()) > 1_000_000 {
-		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "Payload too large"})
-	}
-
-	// Section 3.4 — CSRF mitigation for JSON API: browsers cannot set
-	// Content-Type: application/json in cross-origin requests without a CORS
-	// preflight, making this an effective CSRF defence for this endpoint.
-	ct := c.Get("Content-Type")
-	if !strings.HasPrefix(ct, "application/json") {
-		return c.Status(http.StatusUnsupportedMediaType).JSON(fiber.Map{
-			"status":  false,
-			"message": "Content-Type must be application/json",
-		})
-	}
-
-	var input inputLogin
-	if err := c.BodyParser(&input); err != nil {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"status": false, "message": "Invalid request body"})
-	}
-	if err := input.Validate(); err != nil {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"status": false, "message": err})
-	}
-
-	// Section 5.5 — APSC-DV-000530 CAT I: account lockout after maxLoginAttempts failures.
-	if isLockedOut(input.Username) {
-		logger.Log.Warn("loginHandler", "msg", "account locked out", "username", input.Username, "ip", c.IP())
-		return c.Status(http.StatusTooManyRequests).JSON(fiber.Map{
-			"status":  false,
-			"message": "Account temporarily locked. Try again later.",
-		})
-	}
-
-	authenticated, staffDetails, err := authenticateWithAD(input.Username, input.Password)
-	if err != nil {
-		// Record failure and log internally; return generic message to client to prevent
-		// information disclosure (username enumeration, LDAP error leakage).
-		recordFailedAttempt(input.Username)
-		logger.Log.Error("loginHandler",
-			"err", err,
-			"msg", "authentication failed",
-			"username", input.Username,
-			"ip", c.IP(),
-		)
-		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
-			"status":  false,
-			"message": "Invalid username or password",
-		})
-	}
-	if !authenticated {
-		recordFailedAttempt(input.Username)
-		logger.Log.Warn("loginHandler",
-			"msg", "authentication rejected",
-			"username", input.Username,
-			"ip", c.IP(),
-		)
-		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{
-			"status":  false,
-			"message": "Invalid username or password",
-		})
-	}
-
-	// Authentication successful — clear any existing lockout and create a session.
-	clearLockout(input.Username)
-	logger.Log.Info("loginHandler",
-		"msg", "login successful",
-		"username", input.Username,
-		"ip", c.IP(),
-	)
-
-	// Section 3.2 — create session with secure cookie flags (HttpOnly, Secure, SameSite=Strict).
-	// Session cookie is configured on sessionStore in main() — flags set there apply here.
-	sess, err := sessionStore.Get(c)
-	if err != nil {
-		logger.Log.Error("loginHandler", "err", err, "msg", "failed to create session")
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-			"status":  false,
-			"message": "authentication failed",
-		})
-	}
-	sess.Set("user_email", staffDetails.Email)
-	sess.Set("user_firstname", staffDetails.Firstname)
-	sess.Set("user_lastname", staffDetails.Lastname)
-	if err := sess.Save(); err != nil {
-		logger.Log.Error("loginHandler", "err", err, "msg", "failed to save session")
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{
-			"status":  false,
-			"message": "authentication failed",
-		})
-	}
-
-	return c.Status(http.StatusOK).JSON(fiber.Map{
-		"status": true,
-		"data": fiber.Map{
-			"firstname": staffDetails.Firstname,
-			"lastname":  staffDetails.Lastname,
-			"email":     staffDetails.Email,
-		},
-		"message": "success",
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Log file helpers
-// ---------------------------------------------------------------------------
-
-// countLines streams the file and returns the number of lines without buffering content.
-func countLines(f *os.File) (int, error) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return 0, fmt.Errorf("seek failed: %w", err)
-	}
-	var n int
-	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 4096)
-	scanner.Buffer(buf, maxLineLength)
-	const maxLineCount = 10_000_000
-	for scanner.Scan() {
-		n++
-		if n > maxLineCount {
-			return 0, fmt.Errorf("file exceeds maximum line count (%d lines)", maxLineCount)
+func safeLogValue(value string) string {
+	value = strings.Map(func(char rune) rune {
+		if char == '\n' || char == '\r' || char == '\t' || unicode.IsControl(char) {
+			return -1
 		}
+		return char
+	}, value)
+	if len(value) > maxUsernameBytes {
+		return value[:maxUsernameBytes]
 	}
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("scanner error: %w", err)
-	}
-	return n, nil
+	return value
 }
 
-// readLogPage reads a single page of lines: skips the first 'skip' lines, then reads 'take' lines.
-// The returned slice is ordered newest-first (reversed from file order).
-//
-// DoS mitigations — designed to be visible to static analysis (Checkmarx) at the I/O layer:
-//
-//  1. Input validation rejects out-of-range take/skip before any I/O.
-//  2. io.LimitedReader caps total bytes read at the reader level (maxPageMemoryBytes);
-//     the byte ceiling is enforced before any string is allocated, making it
-//     provably bounded to static analysis tools.
-//  3. The result slice is pre-allocated to exactly `take` (≤ MAX_LOG_LINES) entries and
-//     populated via index assignment — no append, no dynamic growth.
-//  4. Scanner buffer is fixed at maxLineSize; bufio.ErrTooLong is surfaced as ErrLineTooLong.
-func readLogPage(f *os.File, skip, take int) ([]string, error) {
-	// Input validation BEFORE any I/O — return errors, not silent clamps.
-	if skip < 0 {
-		return nil, fmt.Errorf("skip must be non-negative, got %d", skip)
+func (a *authState) isLocked(username string) bool {
+	key := normalizedUsername(username)
+	now := time.Now()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	entry, exists := a.lockouts[key]
+	if !exists {
+		return false
 	}
-	if take <= 0 || take > MAX_LOG_LINES {
-		return nil, fmt.Errorf("take must be 1–%d, got %d", MAX_LOG_LINES, take)
+	if entry.attempts < loginAttemptsBeforeLock {
+		return false
 	}
-
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek failed: %w", err)
+	if now.Sub(entry.locked) >= lockoutDuration {
+		delete(a.lockouts, key)
+		return false
 	}
+	return true
+}
 
-	// io.LimitedReader enforces the total-byte ceiling at the I/O layer.
-	// Once lr.N reaches zero the reader returns io.EOF, preventing any further
-	// allocation regardless of file size. This bound is visible to static analysis
-	// before scanner.Text() is ever called.
-	lr := &io.LimitedReader{R: f, N: maxPageMemoryBytes}
+func (a *authState) recordFailure(username string) {
+	key := normalizedUsername(username)
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	// Fixed scanner buffer — per-line cap; bufio.ErrTooLong mapped to ErrLineTooLong below.
-	scanner := bufio.NewScanner(lr)
-	buf := make([]byte, maxLineSize)
-	scanner.Buffer(buf, maxLineSize)
+	entry := a.lockouts[key]
+	entry.attempts++
+	if entry.attempts >= loginAttemptsBeforeLock {
+		entry.locked = time.Now()
+	}
+	a.lockouts[key] = entry
+}
 
-	// Pre-allocate to exactly `take` entries (take ≤ MAX_LOG_LINES, validated above).
-	// Index-based assignment means the slice length is statically bounded — no append,
-	// no dynamic reallocation, no unbounded growth path for taint analysis to follow.
-	lines := make([]string, take)
-	skipped, count := 0, 0
+func (a *authState) clearFailures(username string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.lockouts, normalizedUsername(username))
+}
 
-	for scanner.Scan() {
-		if skipped < skip {
-			skipped++
-			continue
+func showLogs(c *fiber.Ctx) error {
+	page := queryInt(c, "page", 1, 1, 100000)
+	limit := queryInt(c, "limit", defaultLogPageSize, 1, maxLogPageSize)
+
+	file, err := logger.OpenCurrentLogForRead()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return renderLogs(c, []string{}, page, limit, 0)
 		}
-		if count >= take {
+		logger.Log.Error("logs", "error", err)
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		logger.Log.Error("logs", "error", err)
+		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "internal server error"})
+	}
+	if info.Size() > maxLogFileBytes {
+		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "log file is too large"})
+	}
+
+	lines, err := readBoundedLines(file)
+	if err != nil {
+		logger.Log.Warn("logs", "error", err)
+		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "log file cannot be displayed"})
+	}
+
+	total := len(lines)
+	start := total - (page * limit)
+	if start < 0 {
+		start = 0
+	}
+	end := total - ((page - 1) * limit)
+	if end < 0 {
+		end = 0
+	}
+	if start > end {
+		start = end
+	}
+
+	pageLines := make([]string, end-start)
+	copy(pageLines, lines[start:end])
+	reverseStrings(pageLines)
+
+	return renderLogs(c, pageLines, page, limit, total)
+}
+
+func queryInt(c *fiber.Ctx, name string, fallback, minValue, maxValue int) int {
+	raw := c.Query(name)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minValue {
+		return fallback
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func readBoundedLines(reader io.Reader) ([]string, error) {
+	limited := io.LimitedReader{R: reader, N: maxLogReadBytes}
+	buffered := bufio.NewReaderSize(&limited, maxLogLineBytes)
+
+	lines := make([]string, 0, maxLogLines)
+	for {
+		if len(lines) >= maxLogLines {
+			return nil, errTooManyLines
+		}
+		line, err := buffered.ReadString('\n')
+		if len(line) > maxLogLineBytes {
+			return nil, errLineTooLong
+		}
+		if line != "" {
+			lines = append(lines, strings.TrimRight(line, "\r\n"))
+		}
+		if errors.Is(err, io.EOF) {
 			break
 		}
-		lines[count] = scanner.Text()
-		count++
-	}
-
-	// lr.N == 0 means the LimitedReader exhausted its byte budget before the page was complete.
-	if lr.N == 0 {
-		return nil, ErrPayloadTooLarge
-	}
-
-	if err := scanner.Err(); err != nil {
-		if errors.Is(err, bufio.ErrTooLong) {
-			return nil, ErrLineTooLong
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return nil, errLineTooLong
 		}
-		return nil, fmt.Errorf("scanner error: %w", err)
+		if err != nil {
+			return nil, err
+		}
+		if limited.N == 0 {
+			return nil, errReadTooLarge
+		}
 	}
-
-	lines = lines[:count]
-
-	// Reverse so newest (last in file) is first on the page.
-	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
-		lines[i], lines[j] = lines[j], lines[i]
-	}
-
 	return lines, nil
 }
 
-// ---------------------------------------------------------------------------
-// Log viewer handler (authentication enforced via authMiddleware)
-// ---------------------------------------------------------------------------
+func reverseStrings(values []string) {
+	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
+		values[left], values[right] = values[right], values[left]
+	}
+}
 
-// ShowLogs serves log file content with pagination. Only one page of lines is loaded into memory.
-// Query params: page (1-based, default 1), limit (default 20, max 500). Newest lines first.
-func ShowLogs(c *fiber.Ctx) error {
-	pageStr := c.Query("page")
-	if pageStr == "" {
-		pageStr = "1"
-	}
-	page, err := strconv.Atoi(pageStr)
-	if err != nil || page <= 0 {
-		logger.Log.Warn("ShowLogs", "msg", "invalid page param", "value", c.Query("page"), "ip", c.IP())
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid 'page' parameter: must be a positive integer",
-		})
-	}
-
-	limitStr := c.Query("limit")
-	if limitStr == "" {
-		limitStr = "20"
-	}
-	limit, err := strconv.Atoi(limitStr)
-	if err != nil || limit <= 0 {
-		logger.Log.Warn("ShowLogs", "msg", "invalid limit param", "value", c.Query("limit"), "ip", c.IP())
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid 'limit' parameter: must be a positive integer",
-		})
-	}
-	if limit > maxPageSize {
-		limit = maxPageSize
-	}
-
-	filePath := logger.LogPath()
-
-	if err := logger.ValidateLogPath(filePath); err != nil {
-		logger.Log.Error("ShowLogs", "err", err, "path", filePath, "msg", "invalid log path")
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid log path"})
-	}
-
-	// Go 1.24 traversal-resistant API: confine access to the resources root.
-	rootDir := logger.GetRoot()
-	f, err := os.OpenInRoot(rootDir, filepath.Base(filePath))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return c.Status(http.StatusOK).Render("showlog", fiber.Map{
-				"fileLines": []string{}, "Page": 1, "Limit": limit, "TotalLines": 0, "TotalPages": 0,
-				"PrevPage": 0, "NextPage": 0, "HasPrev": false, "HasNext": false,
-			})
-		}
-		logger.Log.Error("ShowLogs", "err", err, "path", filePath)
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-	}
-	defer func() {
-		if cerr := f.Close(); cerr != nil {
-			logger.Log.Error("ShowLogs", "err", cerr, "path", filePath, "msg", "failed to close log file")
-		}
-	}()
-
-	info, err := f.Stat()
-	if err != nil {
-		logger.Log.Error("ShowLogs", "err", err, "path", filePath)
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-	}
-	maxBytes := int64(maxLogSizeMB) * 1024 * 1024
-	if info.Size() > maxBytes {
-		return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{
-			"error": fmt.Sprintf("log file exceeds maximum size of %d MB", maxLogSizeMB),
-		})
-	}
-
-	totalLines, err := countLines(f)
-	if err != nil {
-		logger.Log.Error("ShowLogs", "err", err, "path", filePath)
-		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-	}
-
-	totalPages := (totalLines + limit - 1) / limit
-	if totalPages == 0 {
-		totalPages = 1
+func renderLogs(c *fiber.Ctx, lines []string, page, limit, total int) error {
+	totalPages := 1
+	if total > 0 {
+		totalPages = (total + limit - 1) / limit
 	}
 	if page > totalPages {
 		page = totalPages
 	}
-
-	// Newest-first: skip = totalLines - page*limit, clamped to 0.
-	skip := totalLines - page*limit
-	if skip < 0 {
-		skip = 0
-	}
-	take := limit
-	if totalLines-skip < take {
-		take = totalLines - skip
-	}
-	if take <= 0 {
-		return c.Render("showlog", fiber.Map{
-			"fileLines": []string{}, "Page": page, "Limit": limit,
-			"TotalLines": totalLines, "TotalPages": totalPages,
-			"PrevPage": 0, "NextPage": 0, "HasPrev": false, "HasNext": false,
-		})
-	}
-
-	logRecords, err := readLogPage(f, skip, take)
-	if err != nil {
-		// Section 3.6: sanitize error responses — log internally, return generic message.
-		switch {
-		case errors.Is(err, ErrLineTooLong),
-			errors.Is(err, ErrTooManyLines),
-			errors.Is(err, ErrPayloadTooLarge):
-			logger.Log.Warn("ShowLogs", "err", err, "path", filePath)
-			return c.Status(http.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "Request payload too large"})
-		default:
-			logger.Log.Error("ShowLogs", "err", err, "path", filePath)
-			return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-		}
-	}
-
 	return c.Render("showlog", fiber.Map{
-		"fileLines":  logRecords,
+		"Lines":      lines,
 		"Page":       page,
 		"Limit":      limit,
-		"TotalLines": totalLines,
+		"TotalLines": total,
 		"TotalPages": totalPages,
 		"PrevPage":   page - 1,
 		"NextPage":   page + 1,
 		"HasPrev":    page > 1,
 		"HasNext":    page < totalPages,
 	})
-}
-
-// ---------------------------------------------------------------------------
-// Application entry point
-// ---------------------------------------------------------------------------
-
-func main() {
-	logger.Start()
-
-	// Log rotation: remove files older than 3 days.
-	loggerMu.Lock()
-	logger.CleanupOldLogs()
-	loggerMu.Unlock()
-	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			loggerMu.Lock()
-			logger.CleanupOldLogs()
-			loggerMu.Unlock()
-		}
-	}()
-
-	if err := godotenv.Load("config.env"); err != nil {
-		logger.Log.Error("LoadConfig", "err", err)
-	}
-
-	// Section 5.5 — TLS support for the HTTP server.
-	// Set TLS_CERT_FILE and TLS_KEY_FILE env vars to enable HTTPS.
-	// CookieSecure on sessions requires HTTPS; running plain HTTP in production is prohibited.
-	certFile := os.Getenv("TLS_CERT_FILE")
-	keyFile  := os.Getenv("TLS_KEY_FILE")
-	tlsEnabled := certFile != "" && keyFile != ""
-	if !tlsEnabled {
-		logger.Log.Warn("main",
-			"msg", "TLS not configured — running HTTP. Set TLS_CERT_FILE and TLS_KEY_FILE for HTTPS.",
-			"compliance", "HTTPS required in production (PCI DSS 4.1, ASD STIG)")
-	}
-
-	// Section 3.2 — Session store with secure cookie flags.
-	// CookieSecure is enabled only when TLS is active to avoid breaking dev/HTTP environments.
-	// In production (TLS enabled), all three flags MUST be set.
-	sessionStore = session.New(session.Config{
-		Expiration:     sessionTimeout,
-		CookieHTTPOnly: true,                // APSC-DV-002210: HttpOnly flag
-		CookieSecure:   tlsEnabled,          // APSC-DV-002220: Secure flag (requires HTTPS)
-		CookieSameSite: "Strict",            // CSRF mitigation via SameSite=Strict
-		CookiePath:     "/",
-	})
-
-	resourcesPath := logger.GetRoot()
-	engine := html.New(resourcesPath, ".html")
-	engine.Reload(true)
-
-	app := fiber.New(fiber.Config{
-		Views:        engine,
-		BodyLimit:    10 * 1024 * 1024,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  30 * time.Second,
-	})
-
-	// NOTE: app.Static is intentionally NOT registered.
-	// Previously `app.Static("/", resourcesPath)` was serving raw log files (.txt) from the
-	// resources directory at the root URL, bypassing authentication entirely.
-	// Log content is now exclusively accessible via the authenticated /logs route.
-
-	// Global rate limiter — 5 requests per minute per client IP.
-	app.Use(limiter.New(limiter.Config{Max: 5, Expiration: 1 * time.Minute}))
-
-	// Security response headers — applied globally to all routes.
-	//
-	// X-Frame-Options: DENY — legacy browser clickjacking protection.
-	// Content-Security-Policy:
-	//   default-src 'self'       — restricts all resource loads to same origin (XSS mitigation).
-	//   script-src 'self'        — blocks inline scripts and untrusted script sources.
-	//   object-src 'none'        — disables Flash/plugin vectors.
-	//   base-uri 'self'          — prevents base-tag hijacking.
-	//   frame-ancestors 'none'   — modern clickjacking protection (replaces X-Frame-Options).
-	// X-Content-Type-Options: nosniff — prevents MIME-type sniffing attacks.
-	// Referrer-Policy: strict-origin-when-cross-origin — limits referrer leakage.
-	//
-	// Compliance: NIST SI-15, OWASP A7, PCI DSS 6.5.7, ASD STIG APSC-DV-002490.
-	app.Use(func(c *fiber.Ctx) error {
-		c.Set("X-Frame-Options", "DENY")
-		c.Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
-		c.Set("X-Content-Type-Options", "nosniff")
-		c.Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		return c.Next()
-	})
-
-	app.Post("/login", loginHandler)
-
-	// /logs is protected — authMiddleware validates the session before ShowLogs runs.
-	app.Get("/logs", authMiddleware, ShowLogs)
-
-	port := os.Getenv("DAVTON_PORT")
-	if port == "" {
-		port = "8080"
-		logger.Log.Error("main", "msg", "DAVTON_PORT not set, using default 8080")
-	}
-
-	if tlsEnabled {
-		logger.Log.Info("main", "msg", "starting HTTPS server", "port", port)
-		if err := app.ListenTLS(":"+port, certFile, keyFile); err != nil {
-			logger.Log.Error("main", "err", err, "msg", "HTTPS server failed")
-			os.Exit(1)
-		}
-	} else {
-		logger.Log.Info("main", "msg", "starting HTTP server", "port", port)
-		if err := app.Listen(":" + port); err != nil {
-			logger.Log.Error("main", "err", err, "msg", "HTTP server failed")
-			os.Exit(1)
-		}
-	}
 }
