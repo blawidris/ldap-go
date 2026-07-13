@@ -1,6 +1,6 @@
 module davtonad
 
-go 1.24.0
+go 1.25.12
 
 require (
 	github.com/go-ldap/ldap/v3 v3.4.10
