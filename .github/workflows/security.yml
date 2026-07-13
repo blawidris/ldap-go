@@ -14,19 +14,21 @@ jobs:
   gosec:
     name: gosec (SAST)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: davtonad/go.mod
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
       - name: Run gosec
-        uses: securego/gosec@9e6a9843d7a4a6e3e9a8539b02612c8a4aa3f889 # v2.27.1
-        with:
-          args: -fmt sarif -out gosec-results.sarif ./...
-          working-directory: davtonad
+        run: gosec -fmt sarif -out gosec-results.sarif ./...
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         with:
           sarif_file: davtonad/gosec-results.sarif
 
